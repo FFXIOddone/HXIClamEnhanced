@@ -12,16 +12,59 @@ addon.desc     = 'HorizonXI clamming tracker with analytics, webhooks, cloud exp
 addon.link     = 'https://github.com/jimmy58663/HXIClam';
 addon.commands = {'/hxiclam'};
 
--- Forward declarations for all functions to ensure they are defined before use
-local normalize_item, format_int, format_time_hms, ensure_color, deepcopy, is_dense_array, json_sanitize, to_json_safe
-local set_index_value, remove_index_entry, parse_pairs, build_keys_union, update_pricing, update_weights
-local WriteLog, create_backup, export_session
-local safe_copy, copy_to_cloud_if_enabled, write_mobile_companion_json
-local vana_timestamp, get_moon, get_current_zone, update_zone_tracking
-local update_tones, maybe_play_ready_tone
-local _nearest_cap_key, _stop_params, _opt_threshold, _opt_color, updateWeightColor, getProfitPercentageColor
-local push_imgui_style, pop_imgui_style, help
-local discord_enqueue
+
+
+local constants = require('modules.constants')
+local utils = require('modules.utils')
+local fileio = require('modules.fileio')
+local analytics = require('modules.analytics')
+local display = require('modules.display')
+local sound = require('modules.sound')
+local discord = require('modules.discord')
+local state = require('modules.state')
+local events = require('modules.events')
+
+-- BASE directory for file operations (empty string means current dir)
+BASE = ''
+
+-- Replace T{} with {} for all usages (Ashita v4+)
+function T(t)
+    return t or {}
+end
+
+-- WriteLog stub (should be implemented in fileio module)
+function WriteLog(...)
+    if fileio and fileio.WriteLog then
+        return fileio.WriteLog(...)
+    else
+        -- fallback: do nothing or print
+        -- print('WriteLog called', ...)
+    end
+end
+
+-- Utility function aliases
+local format_int = utils.format_int
+local format_time_hms = utils.format_time_hms
+local deepcopy = utils.deepcopy
+local parse_pairs = utils.parse_pairs
+
+-- Global state table for the addon
+H = {
+    settings = nil,
+    pricing = {},
+    move = {},
+    gil_per_hour = 0,
+    last_analytics_update = 0,
+    play_tone = false,
+    _ui_export_csv = false,
+    _idx = {},
+    session_milestones_hit = {},
+}
+
+-- Initialize settings with defaults if not loaded
+if not H.settings then
+    H.settings = utils.deepcopy(default_settings)
+end
 
 require('common');
 local chat     = require('chat');
@@ -50,180 +93,11 @@ local function render_standard_display(H_)
     imgui.SameLine()
     imgui.TextColored(H_.settings.colors.session_value_color, tostring(H_.settings.bucket_count * H_.settings.clamming.bucket_cost[1]))
 
-    imgui.TextColored(H_.settings.colors.session_label_color, 'Items Dug:')
-    imgui.SameLine()
-    imgui.TextColored(H_.settings.colors.session_value_color, tostring(H_.settings.item_count))
-
-    if H_.settings.moon_display[1] then
-        local moon = get_moon()
-        imgui.TextColored(H_.settings.colors.moon_display_color, 'Moon: ' .. moon.MoonPhase .. ' (' .. tostring(moon.MoonPhasePercent) .. '%)')
-    end
-
-    if H_.settings.show_session_time[1] then
-        local t = format_time_hms(elapsed)
-        imgui.TextColored(H_.settings.colors.session_time_color, 'Session Time:')
-        imgui.SameLine()
-        imgui.TextColored(H_.settings.colors.session_time_color, t)
-    end
-
-    imgui.Separator()
-
-    if H_.settings.session_view > 1 then
-        for k, v in pairs(H_.settings.rewards) do
-            local tot = (H_.pricing[k] or 0) * v
-            imgui.TextColored(H_.settings.colors.bucket_item_name_color, display_name(k) .. ' ')
-            if H_.settings.show_item_quantities[1] then
-                imgui.SameLine()
-                imgui.TextColored(H_.settings.colors.bucket_item_count_color, '[' .. format_int(v) .. ']')
-            end
-            if H_.settings.show_item_values[1] then
-                imgui.SameLine()
-                local ww = imgui.GetWindowWidth()
-                local tw = imgui.CalcTextSize('(' .. format_int(tot) .. ')')
-                imgui.SetCursorPosX(ww - tw - 16)
-                imgui.TextColored(H_.settings.colors.bucket_item_value_color, '(' .. format_int(tot) .. ')')
-            end
-        end
-        imgui.Separator()
-    end
-
-    if H_.settings.clamming.bucket_subtract[1] then
-        total_worth = total_worth - (H_.settings.bucket_count * H_.settings.clamming.bucket_cost[1])
-        if (ashita.time.clock()['s'] % 3) == 0 and elapsed > 0 then
-            H_.gil_per_hour = math.floor((total_worth / elapsed) * 3600)
-        end
-        imgui.TextColored(H_.settings.colors.session_total_label_color, 'Total Profit:')
-        imgui.SameLine()
-        imgui.TextColored(H_.settings.colors.session_total_value_color, format_int(total_worth) .. 'g')
-        imgui.SameLine()
-        imgui.TextColored(H_.settings.colors.session_gph_color, '(' .. format_int(H_.gil_per_hour) .. ' gph)')
-    else
-        if (ashita.time.clock()['s'] % 3) == 0 and elapsed > 0 then
-            H_.gil_per_hour = math.floor((total_worth / elapsed) * 3600)
-        end
-        imgui.TextColored(H_.settings.colors.session_total_label_color, 'Total Revenue:')
-        imgui.SameLine()
-        imgui.TextColored(H_.settings.colors.session_total_value_color, format_int(total_worth) .. 'g')
-        imgui.SameLine()
-        imgui.TextColored(H_.settings.colors.session_gph_color, '(' .. format_int(H_.gil_per_hour) .. ' gph)')
-    end
 end
-
--- Safe ImGui flags (fallback to 0)
-local function FG(k) return rawget(_G, k) or 0 end
-local ImGuiWindowFlags_NoDecoration        = FG('ImGuiWindowFlags_NoDecoration')
-local ImGuiWindowFlags_AlwaysAutoResize    = FG('ImGuiWindowFlags_AlwaysAutoResize')
-local ImGuiWindowFlags_NoFocusOnAppearing  = FG('ImGuiWindowFlags_NoFocusOnAppearing')
-local ImGuiWindowFlags_NoNav               = FG('ImGuiWindowFlags_NoNav')
-local ImGuiWindowFlags_NoBackground        = FG('ImGuiWindowFlags_NoBackground')
-local ImGuiCond_Always                     = FG('ImGuiCond_Always')
-local ImGuiTabBarFlags_NoCloseWithMiddleMouseButton = FG('ImGuiTabBarFlags_NoCloseWithMiddleMouseButton')
-local ImGuiWindowFlags_AlwaysAutoResize2   = ImGuiWindowFlags_AlwaysAutoResize -- alias for child windows
-
-local BASE = addon.path or ''
-_G.__hxiclam_basepath = BASE
-
-local have_json, json   = pcall(require, 'json')
-local have_http, http   = pcall(require, 'socket.http')
-local have_ltn12, ltn12 = pcall(require, 'ltn12')
-
----------------------------------------------------------------------------------------------------
--- Constants (moon tables, display names, index/weights)
----------------------------------------------------------------------------------------------------
-local ItemDisplayNames = {
-    ['pebble'] = 'Pebble',
-    ['bibiki slug'] = 'B.Slug',
-    ['jacknife'] = 'Jacknife',
-    ['clump of pamtam kelp'] = 'P.Kelp',
-    ['vongola clam'] = 'V.Clam',
-    ['shall shell'] = 'S.Shell',
-    ['handful of fish scales'] = 'F.Scales',
-    ['handful of pugil scales'] = 'P.Scales',
-    ['handful of high-quality pugil scales'] = 'HQ P.Scales',
-    ['coral fragment'] = 'Coral Frag',
-    ['crab shell'] = 'Crab Shell',
-    ['high-quality crab shell'] = 'HQ Crab',
-    ['sack of white sand'] = 'W.Sand',
-    ['seashell'] = 'Seashell',
-    ['nebimonite'] = 'Nebimonite',
-    ['bibiki urchin'] = 'B.Urchin',
-    ['tropical clam'] = 'Tropical Clam',
-    ['titanictus shell'] = 'Titan Shell',
-    ['turtle shell'] = 'Turtle Shell',
-    ['uragnite shell'] = 'Urag Shell',
-    ['maple log'] = 'Maple Log',
-    ['lacquer tree log'] = 'Lacquer Log',
-    ['elm log'] = 'Elm Log',
-    ['petrified log'] = 'Petrified Log',
-    ['loaf of hobgoblin bread'] = 'HG Bread',
-    ['hobgoblin pie'] = 'HG Pie',
-    ['goblin mask'] = 'Gob Mask',
-    ['suit of goblin armor'] = 'Gob Armor',
-    ['suit of goblin mail'] = 'Gob Mail',
-    ['broken willow fishing rod'] = 'Broken Rod',
-    ['piece of oxblood'] = 'Oxblood',
-}
-
-local MoonPhasePercent = {
-    [ 1]= 96,[ 2]= 92,[ 3]= 88,[ 4]= 84,[ 5]= 80,[ 6]= 76,[ 7]= 72,[ 8]= 68,[ 9]= 64,[10]= 60,
-    [11]= 56,[12]= 52,[13]= 48,[14]= 44,[15]= 40,[16]= 36,[17]= 32,[18]= 28,[19]= 24,[20]= 20,
-    [21]= 16,[22]= 12,[23]=  8,[24]=  4,[25]=  0,[26]=  4,[27]=  8,[28]= 12,[29]= 16,[30]= 20,
-    [31]= 24,[32]= 28,[33]= 32,[34]= 36,[35]= 40,[36]= 44,[37]= 48,[38]= 52,[39]= 56,[40]= 60,
-    [41]= 64,[42]= 68,[43]= 72,[44]= 76,[45]= 80,[46]= 84,[47]= 88,[48]= 92,[49]= 96,[50]=100,
-    [51]=100,[52]=100,[53]= 96,[54]= 92,[55]= 88,[56]= 84,[57]= 80,[58]= 76,[59]= 72,[60]= 68,
-    [61]= 64,[62]= 60,[63]= 56,[64]= 52,[65]= 48,[66]= 44,[67]= 40,[68]= 36,[69]= 32,[70]= 28,
-    [71]= 24,[72]= 20,[73]= 16,[74]= 12,[75]=  8,[76]=  4,[77]=  0,[78]=  4,[79]=  8,[80]= 12,
-    [81]= 16,[82]= 20,[83]= 24,[84]= 28,
-}
-local MoonPhase = {
-    [ 1]='Waning Gibbous',[ 2]='Waning Gibbous',[ 3]='Waning Gibbous',[ 4]='Waning Gibbous',[ 5]='Waning Gibbous',
-    [ 6]='Waning Gibbous',[ 7]='Waning Gibbous',[ 8]='Waning Gibbous',[ 9]='Waning Gibbous',[10]='Waning Gibbous',
-    [11]='Last Quarter'  ,[12]='Last Quarter'  ,[13]='Last Quarter'  ,[14]='Last Quarter'  ,[15]='Last Quarter',
-    [16]='Waning Crescent',[17]='Waning Crescent',[18]='Waning Crescent',[19]='Waning Crescent',[20]='Waning Crescent',
-    [21]='Waning Crescent',[22]='Waning Crescent',[23]='Waning Crescent',[24]='Waning Crescent',[25]='New Moon',
-    [26]='New Moon'       ,[27]='New Moon'       ,[28]='New Moon'       ,[29]='New Moon'       ,[30]='Waxing Crescent',
-    [31]='Waxing Crescent',[32]='Waxing Crescent',[33]='Waxing Crescent',[34]='Waxing Crescent',[35]='Waxing Crescent',
-    [36]='Waxing Crescent',[37]='Waxing Crescent',[38]='Waxing Crescent',[39]='Waxing Crescent',[40]='Waxing Crescent',
-    [41]='New Moon'       ,[42]='New Moon'       ,[43]='New Moon'       ,[44]='New Moon'       ,[45]='New Moon',
-    [46]='Waxing Crescent',[47]='Waxing Crescent',[48]='Waxing Crescent',[49]='Waxing Crescent',[50]='Waxing Crescent',
-    [51]='Waxing Crescent',[52]='Waxing Crescent',[53]='Waxing Crescent',[54]='Waxing Crescent',[55]='Waxing Crescent',
-    [56]='Waxing Crescent',[57]='Waxing Crescent',[58]='Waxing Crescent',[59]='First Quarter' ,[60]='First Quarter',
-    [61]='First Quarter'  ,[62]='First Quarter'  ,[63]='First Quarter'  ,[64]='First Quarter'  ,[65]='First Quarter',
-    [66]='First Quarter'  ,[67]='Waxing Gibbous' ,[68]='Waxing Gibbous' ,[69]='Waxing Gibbous' ,[70]='Waxing Gibbous',
-    [71]='Waxing Gibbous' ,[72]='Waxing Gibbous' ,[73]='Waxing Gibbous' ,[74]='Waxing Gibbous' ,[75]='Waxing Gibbous',
-    [76]='Waxing Gibbous' ,[77]='Waxing Gibbous' ,[78]='Waxing Gibbous' ,[79]='Waxing Gibbous' ,[80]='Waxing Gibbous',
-    [81]='Full Moon'      ,[82]='Full Moon'      ,[83]='Full Moon'      ,[84]='Full Moon',
-}
-
--- Price index "name:value"
-local ItemIndex = T{
-    [1]="bibiki slug:11",[2]="bibiki urchin:768",[3]="broken willow fishing rod:0",[4]="coral fragment:1793",
-    [5]="crab shell:380",[6]="high-quality crab shell:3203",[7]="elm log:3800",
-    [8]="handful of fish scales:26",[9]="suit of goblin armor:0",[10]="suit of goblin mail:0",
-    [11]="goblin mask:0",[12]="loaf of hobgoblin bread:100",[13]="hobgoblin pie:165",[14]="jacknife:58",
-    [15]="lacquer tree log:6000",[16]="maple log:16",[17]="nebimonite:300",[18]="piece of oxblood:13581",
-    [19]="clump of pamtam kelp:8",[20]="pebble:1",[21]="petrified log:3400",
-    [22]="handful of pugil scales:25",[23]="handful of high-quality pugil scales:266",
-    [24]="seashell:33",[25]="shall shell:307",[26]="titanictus shell:358",[27]="tropical clam:5227",
-    [28]="turtle shell:1254",[29]="uragnite shell:1455",[30]="vongola clam:196",[31]="sack of white sand:256",
-}
--- Weight index "name:weight"
-local ItemWeightIndex = T{
-    [1]="bibiki slug:3",[2]="bibiki urchin:6",[3]="broken willow fishing rod:6",[4]="coral fragment:6",
-    [5]="crab shell:6",[6]="high-quality crab shell:6",[7]="elm log:6",
-    [8]="handful of fish scales:1",[9]="suit of goblin armor:6",[10]="suit of goblin mail:6",
-    [11]="goblin mask:6",[12]="loaf of hobgoblin bread:6",[13]="hobgoblin pie:6",[14]="jacknife:3",
-    [15]="lacquer tree log:6",[16]="maple log:6",[17]="nebimonite:6",[18]="piece of oxblood:1",
-    [19]="clump of pamtam kelp:1",[20]="pebble:1",[21]="petrified log:6",
-    [22]="handful of pugil scales:1",[23]="handful of high-quality pugil scales:1",
-    [24]="seashell:1",[25]="shall shell:6",[26]="titanictus shell:6",[27]="tropical clam:6",
-    [28]="turtle shell:6",[29]="uragnite shell:6",[30]="vongola clam:6",[31]="sack of white sand:6",
-}
-
----------------------------------------------------------------------------------------------------
+-- (moved into default_settings table below)
 -- State / Settings / IO
 ---------------------------------------------------------------------------------------------------
-local LOGS = T{
+local LOGS = {
     drop_log_dir   = 'drops',
     turnin_log_dir = 'turnins',
     backup_log_dir = 'backups',
@@ -231,36 +105,33 @@ local LOGS = T{
     char_name      = nil
 }
 
-local default_settings = T{
-    visible = T{ true },
-    moon_display = T{ false },
-    display_timeout = T{ 600 },
-    opacity = T{ 1.0 },
-    padding = T{ 1.0 },
-    scale = T{ 1.0 },
+local default_settings = {
+    visible = { true },
+    moon_display = { false },
+    display_timeout = { 600 },
+    opacity = { 1.0 },
+    padding = { 1.0 },
+    scale = { 1.0 },
     item_index = ItemIndex,
     item_weight_index = ItemWeightIndex,
-    font_scale = T{ 1.0 },
-    x = T{ 100 }, y = T{ 100 },
-    enable_logging = T{ true },
-    show_session_time = T{ true },
-    show_item_quantities = T{ true },
-    show_item_values = T{ true },
+    font_scale = { 1.0 },
+    show_item_quantities = { true },
+    show_item_values = { true },
     first_attempt = 0,
-    display_mode = T{ 2 }, -- 1=minimal, 2=standard, 3=detailed, 4=overlay
-    reset_on_load = T{ false },
+    display_mode = { 2 }, -- 1=minimal, 2=standard, 3=detailed, 4=overlay
+    reset_on_load = { false },
 
-    available_tones = T{ 'clam.wav' },
+    available_tones = { 'clam.wav' },
     tone_selected_idx = 1,
     tone = 'clam.wav',
-    enable_tone = T{ true },
+    enable_tone = { true },
 
     dig_timer = 0,
     dig_timer_countdown = true,
     last_dig = 0,
 
-    bucket = T{},
-    rewards = T{},
+    bucket = {},
+    rewards = {},
     bucket_weight = 0,
     bucket_capacity = 50,
     has_bucket = false,
@@ -271,106 +142,106 @@ local default_settings = T{
     gil_per_hour = 0,
 
     clamming = {
-        bucket_cost = T{ 500 },
-        bucket_subtract = T{ true },
-        stop_values = { [50]=T{1200},[100]=T{2400},[150]=T{3600},[200]=T{4800} },
-        stop_weights_under_value = { [50]=T{4},[100]=T{6},[150]=T{8},[200]=T{10} },
-        stop_weights_over_value  = { [50]=T{6},[100]=T{8},[150]=T{10},[200]=T{12} },
+        bucket_cost = { 500 },
+        bucket_subtract = { true },
+        stop_values = { [50]={1200},[100]={2400},[150]={3600},[200]={4800} },
+        stop_weights_under_value = { [50]={4},[100]={6},[150]={8},[200]={10} },
+        stop_weights_over_value  = { [50]={6},[100]={8},[150]={10},[200]={12} },
         stop_colors = { [50]={1,0.55,0,1},[100]={1,0.55,0,1},[150]={1,0.55,0,1},[200]={1,0.55,0,1} },
-        color_logic_advanced = T{ true },
+        color_logic_advanced = { true },
     },
 
     analytics = {
-        enabled = T{ true },
-        efficiency_history = T{},
-        item_frequency = T{},
+        enabled = { true },
+        efficiency_history = {},
+        item_frequency = {},
     },
 
     notifications = {
-        enabled = T{ true },
-        milestone_index = T{ 1 },
+        enabled = { true },
+        milestone_index = { 1 },
         profit_milestones = { 500, 1000, 2500, 5000, 10000, 20000 },
-        sound_enabled = T{ true },
-        efficiency_warnings = T{ true },
-        break_reminders = T{ true },
-        break_reminder_interval = T{ 3600 },
+        sound_enabled = { true },
+        efficiency_warnings = { true },
+        break_reminders = { true },
+        break_reminder_interval = { 3600 },
     },
 
     milestones_dynamic = {
-        enabled = T{ true },
-        scale = T{ 1.5 },
-        min_gap = T{ 1000 },
+        enabled = { true },
+        scale = { 1.5 },
+        min_gap = { 1000 },
     },
 
     summary = {
-        one_click_enabled = T{ true },
-        include_items = T{ true },
-        include_zones = T{ true },
-        send_to_discord = T{ false },
-        save_as_file = T{ true },
+        one_click_enabled = { true },
+        include_items = { true },
+        include_zones = { true },
+        send_to_discord = { false },
+        save_as_file = { true },
     },
 
     autoscreenshot = {
-        enabled = T{ false }, on_milestone = T{ true }, on_rare_item = T{ true }, on_best_streak = T{ true },
+        enabled = { false }, on_milestone = { true }, on_rare_item = { true }, on_best_streak = { true },
     },
 
     zone_tracking = {
-        enabled = T{ true },
-        current_zone = T{ '' },
-        zone_start_time = T{ 0 },
-        zone_stats = T{},
+        enabled = { true },
+        current_zone = { '' },
+        zone_start_time = { 0 },
+        zone_stats = {},
     },
 
     discord = {
-        enabled = T{ false },
-        webhook_url = T{ '' },
-        queue_limit = T{ 50 },
-        max_per_minute = T{ 10 },
-        send_milestones = T{ true },
-        send_streaks = T{ true },
-        send_summaries = T{ true },
+        enabled = { false },
+        webhook_url = { '' },
+        queue_limit = { 50 },
+        max_per_minute = { 10 },
+        send_milestones = { true },
+        send_streaks = { true },
+        send_summaries = { true },
     },
 
     achievements = {
-        enabled = T{ true },
-        unlocked = T{},
-        webhook  = T{ true },
+        enabled = { true },
+        unlocked = {},
+        webhook  = { true },
     },
 
     smart = {
-        turnin_enabled = T{ false },
-        turnin_aggressiveness = T{ 0.5 },
-        show_banner = T{ true },
+        turnin_enabled = { false },
+        turnin_aggressiveness = { 0.5 },
+        show_banner = { true },
     },
 
-    heatmap = { enabled = T{ false }, },
+    heatmap = { enabled = { false }, },
 
     sound_themes = {
-        enabled = T{ false },
-        theme = T{ 'default' },
+        enabled = { false },
+        theme = { 'default' },
         files = { default = { ready='clam.wav', milestone='clam.wav' } }
     },
 
     leaderboard = {
-        enabled = T{ false },
-        display_name = T{ 'Clammer' },
-        privacy = T{ 'private' },
-        share_discord = T{ false },
+        enabled = { false },
+        display_name = { 'Clammer' },
+        privacy = { 'private' },
+        share_discord = { false },
     },
 
-    auto_backup_enabled = T{ false },
-    auto_backup_interval = T{ 900 },
+    auto_backup_enabled = { false },
+    auto_backup_interval = { 900 },
 
-    export_format = T{ 1 }, -- 1=CSV, 2=JSON
+    export_format = { 1 }, -- 1=CSV, 2=JSON
 
     cloud = {
-        enabled = T{ false },
-        path = T{ '' },
+        enabled = { false },
+        path = { '' },
     },
 
     mobile = {
-        enabled = T{ false },
-        out_path = T{ '' },
+        enabled = { false },
+        out_path = { '' },
     },
 
     colors = {
@@ -382,300 +253,27 @@ local default_settings = T{
         session_time_color={0.85,0.85,0.95,1.00},
         revenue_label_color={0.80,0.90,1.00,1.00}, revenue_amount_color={0.80,0.95,0.80,1.00},
         profit_label_color={0.95,0.95,0.80,1.00}, profit_amount_positive_color={0.50,1.00,0.50,1.00}, profit_amount_negative_color={1.00,0.50,0.50,1.00},
-        profit_percentage_tiers = { {percent=T{25}, color={0.85,0.85,0.85,1}}, {percent=T{50}, color={0.70,1.00,0.70,1}}, {percent=T{100}, color={0.30,1.00,0.30,1}}, },
-        use_percentage_profit_colors = T{ true },
+        profit_percentage_tiers = { {percent={25}, color={0.85,0.85,0.85,1}}, {percent={50}, color={0.70,1.00,0.70,1}}, {percent={100}, color={0.30,1.00,0.30,1}}, },
+        use_percentage_profit_colors = { true },
         has_bucket_color={0.80,1.00,0.85,1.00}, no_bucket_color={1.00,0.70,0.70,1.00},
         bucket_item_name_color={0.90,0.90,0.90,1.00}, bucket_item_count_color={0.95,0.95,0.80,1.00}, bucket_item_value_color={0.80,0.95,0.80,1.00},
         dig_timer_normal_color={0.85,0.85,0.90,1.00}, dig_timer_ready_color={0.50,1.00,0.50,1.00},
         bucket_weight_warn_color={1.00,0.80,0.35,1.00}, bucket_weight_crit_color={1.00,0.40,0.40,1.00},
-        bucket_weight_warn_threshold=T{8}, bucket_weight_crit_threshold=T{4},
+        bucket_weight_warn_threshold={8}, bucket_weight_crit_threshold={4},
         zone_label_color={0.85,0.85,0.90,1.00}, zone_value_color={0.90,0.95,1.00,1.00},
         milestone_color={0.90,1.00,0.90,1.00},
-        bucket_weight_font_scale=T{1.0},
+        bucket_weight_font_scale={1.0},
         efficiency_good_color={0.50,1.00,0.50,1.00}, efficiency_warning_color={1.00,0.80,0.35,1.00}, efficiency_poor_color={1.00,0.40,0.40,1.00},
         session_gph_color={0.80,0.90,1.00,1.00}, moon_display_color={0.85,0.85,0.95,1.00},
     },
 
-    editor = { is_open = T{ false } },
+    editor = { is_open = { false } },
     last_break_reminder = 0,
 }
 
-local H = T{}
-H.settings = settings.load(default_settings)
-H.pricing  = {}
-H.weights  = {}
-H.move     = { dragging=false, shift_down=false, drag_x=0, drag_y=0 }
-H.last_cleanup_time = 0
-H.last_attempt = 0
-H.has_bucket = false
-H.gil_per_hour = 0
-H.play_tone = false
-
----------------------------------------------------------------------------------------------------
--- Utility Functions
----------------------------------------------------------------------------------------------------
-local function normalize_item(name) return (name or ''):lower():gsub('%s+', ' ') end
-
-local function format_int(n)
-    if n == nil then return '0' end
-    if type(n) ~= 'number' then return tostring(n or 0) end
-    local s, neg = tostring(math.floor(n)), n < 0 and '-' or ''
-    s = s:gsub('^-', '')
-        local out = s:reverse():gsub('(%d%d%d)', '%1,'):reverse():gsub('^,', '')
-        return neg .. out
-    end
-
-local function format_time_hms(sec)
-    sec = math.max(0, math.floor(sec or 0))
-    if not sec or type(sec) ~= 'number' then return '00:00:00' end
-    local h = math.floor(sec / 3600)
-    local m = math.floor((sec % 3600) / 60)
-    local s = sec % 60
-    return string.format('%02d:%02d:%02d', h, m, s)
-end
-
-local function ensure_color(colors, key, default)
-    if not colors then return default end
-    if type(colors[key]) ~= 'table' or #colors[key] < 4 then
-        colors[key] = { default[1], default[2], default[3], default[4] }
-    end
-    return colors[key]
-end
-
-local function deepcopy(tbl)
-    if tbl == nil then return nil end
-    if type(tbl) ~= 'table' then return tbl end
-    local t = {}
-    for k, v in pairs(tbl) do t[k] = deepcopy(v) end
-    return t
-end
-
-local function is_dense_array(t)
-    if t == nil or type(t) ~= 'table' then return false end
-    local n = #t
-    for k, _ in pairs(t) do
-        if type(k) ~= 'number' or k < 1 or k > n or k % 1 ~= 0 then
-            return false
-        end
-    end
-    return true
-end
-
-local function json_sanitize(v)
-    if v == nil then return nil end
-    local tv = type(v)
-    if tv == 'nil' then return nil end
-    if tv == 'number' or tv == 'string' or tv == 'boolean' then return v end
-    if tv == 'function' or tv == 'userdata' or tv == 'thread' then return tostring(v) end
-    if tv ~= 'table' then return v end
-
-    local out
-    if is_dense_array(v) then
-        out = {}
-        for i = 1, #v do out[i] = json_sanitize(v[i]) end
-        return out
-    end
-
-    out = {}
-    for k, val in pairs(v) do
-        out[tostring(k)] = json_sanitize(val)
-    end
-    return out
-end
-
-local function to_json_safe(tbl)
-    if not have_json or not tbl then return nil end
-    return json.encode(json_sanitize(tbl))
-end
-
----------------------------------------------------------------------------------------------------
--- Index Management Functions
----------------------------------------------------------------------------------------------------
-local function set_index_value(list, name, value)
-    name = normalize_item(name)
-    local found = false
-    for i, s in ipairs(list) do
-        local n = s:match('^(.-):')
-        if n and normalize_item(n) == name then
-            list[i] = n .. ':' .. tostring(tonumber(value) or 0)
-            found = true
-            break
-        end
-    end
-    if not found then
-        table.insert(list, name .. ':' .. tostring(tonumber(value) or 0))
-    end
-end
-
-local function remove_index_entry(list, name)
-    name = normalize_item(name)
-    for i = #list, 1, -1 do
-        local n = list[i]:match('^(.-):')
-        if n and normalize_item(n) == name then
-            table.remove(list, i)
-        end
-    end
-end
-
-local function parse_pairs(list)
-    local out = {}
-    if not list then return out end
-    for _, s in ipairs(list) do
-        local name, val = s:match('^(.-):(%-?%d+)$')
-        if name and val then out[normalize_item(name)] = tonumber(val) end
-    end
-    return out
-end
-
-local function build_keys_union(H_)
-    local set, keys = {}, {}
-    if not H_ then return keys end
-    for k in pairs(H_.pricing or {}) do set[k] = true end
-    for k in pairs(H_.weights or {}) do set[k] = true end
-    for k in pairs(ItemDisplayNames or {}) do set[k] = true end
-    for k in pairs(set) do table.insert(keys, k) end
-    table.sort(keys)
-    return keys
-end
-
-local function update_pricing() H.pricing = parse_pairs(H.settings and H.settings.item_index or {}) end
-local function update_weights() H.weights = parse_pairs(H.settings and H.settings.item_weight_index or {}) end
-
----------------------------------------------------------------------------------------------------
--- File I/O Functions
----------------------------------------------------------------------------------------------------
-local function WriteLog(H_, LOGS_, logtype, item)
-    local install = AshitaCore and AshitaCore:GetInstallPath() or ''
-    if install == '' then return end
-    local dirkey = (logtype == 'drop') and LOGS_.drop_log_dir or LOGS_.turnin_log_dir
-    local dt = os.date('*t')
-    local fname = ('%s_%.4u.%.2u.%.2u.log'):format(LOGS_.char_name or 'unknown', dt.year, dt.month, dt.day)
-    local full = ('%s/addons/hxiclam/logs/%s'):format(install, dirkey)
-    if not ashita.fs.exists(full) then ashita.fs.create_dir(full) end
-    local f = io.open(full .. '/' .. fname, 'a')
-    if f then
-        local zone = (pcall(get_current_zone) and get_current_zone()) or 'Unknown'
-        local line = ('%s, %s, %s\n'):format(os.date('[%H:%M:%S]'), zone, item or '')
-        f:write(line); f:close()
-    end
-end
-
-local function create_backup()
-    local install = AshitaCore and AshitaCore:GetInstallPath() or ''
-    if install == '' then return end
-    local dt = os.date('*t')
-    local dir = ('%s/addons/hxiclam/logs/%s'):format(install, LOGS.backup_log_dir)
-    if not ashita.fs.exists(dir) then ashita.fs.create_dir(dir) end
-    local fname = ('backup_%04d%02d%02d_%02d%02d%02d.json'):format(dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec)
-    local f = io.open(dir .. '/' .. fname, 'wb')
-    if not f then return end
-    local snapshot = {
-        settings       = H.settings,
-        rewards        = H.settings.rewards,
-        bucket         = H.settings.bucket,
-        bucket_weight  = H.settings.bucket_weight
-    }
-    local encoded = to_json_safe(snapshot)
-    if encoded then f:write(encoded) end
-    f:close()
-    if copy_to_cloud_if_enabled then
-        local ok = pcall(copy_to_cloud_if_enabled, H, dir .. '/' .. fname)
-        if not ok then
-            if chat then print(chat.header(addon.name):append(chat.error('Cloud backup failed.'))) end
-        end
-    end
-end
-
-local function export_session(as_json)
-    local install = AshitaCore and AshitaCore:GetInstallPath() or ''
-    if install == '' then return false end
-    local dt = os.date('*t')
-    local dir = ('%s/addons/hxiclam/%s'):format(install, LOGS.export_log_dir)
-    if not ashita.fs.exists(dir) then ashita.fs.create_dir(dir) end
-    local stamp = ('%04d%02d%02d_%02d%02d%02d'):format(dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec)
-    local ext = as_json and '.json' or '.csv'
-    local out
-
-    if not as_json then
-        local lines = { 'item,count,price,value' }
-        local total = 0
-        for k,v in pairs(H.settings.rewards) do
-            local p = H.pricing[k] or 0
-            local val = p * v
-            total = total + val
-            lines[#lines+1] = ('"%s",%d,%d,%d'):format(k, v, p, val)
-        end
-        lines[#lines+1] = ('Total,,,%d'):format(total)
-        out = table.concat(lines, '\n')
-    else
-        local json_data = {
-            bucket_count = H.settings.bucket_count,
-            items_dug = H.settings.item_count,
-            rewards = H.settings.rewards,
-            pricing = H.pricing,
-            weights = H.weights,
-            zone_statistics = H.settings.zone_tracking.zone_stats,
-            analytics = {
-                current_efficiency = H.current_efficiency,
-                efficiency_trend = H.efficiency_trend,
-                milestones_hit = H.session_milestones_hit
-            }
-        }
-        out = have_json and to_json_safe(json_data) or 'null'
-    end
-
-    local fname = ('%s_export_%s%s'):format(LOGS.char_name or 'unknown', stamp, ext)
-    local f = io.open(dir .. '/' .. fname, 'w')
-    if f then
-        f:write(out) f:close()
-        print(chat.header(addon.name):append(chat.message('Session exported to: ' .. fname)))
-        copy_to_cloud_if_enabled(H, dir .. '/' .. fname)
-        write_mobile_companion_json(H)
-        return true
-    end
-    print(chat.header(addon.name):append(chat.error('Failed to export session data.')))
-    return false
-end
-
----------------------------------------------------------------------------------------------------
--- Cloud / Mobile Functions
----------------------------------------------------------------------------------------------------
-local function safe_copy(src, dst)
-    local fi = io.open(src, 'rb'); if not fi then return false end
-    local data = fi:read('*a'); fi:close()
-    local di = io.open(dst, 'wb'); if not di then return false end
-    di:write(data); di:close()
-    return true
-end
-
-local function copy_to_cloud_if_enabled(H_, src_path)
-    if not (H_ and H_.settings.cloud and H_.settings.cloud.enabled[1]) then return end
-    local target_dir = H_.settings.cloud.path[1]
-    if not target_dir or #target_dir == 0 then return end
-    pcall(function()
-        local sep = (package.config:sub(1,1) == '\\') and '\\' or '/'
-        local fname = src_path:match('([^\\/]+)$') or 'export.txt'
-        local dst = target_dir .. sep .. fname
-        safe_copy(src_path, dst)
-    end)
-end
-
-local function write_mobile_companion_json(H_)
-    if not (H_ and H_.settings.mobile and H_.settings.mobile.enabled[1] and have_json) then return end
-    local path = H_.settings.mobile.out_path[1]; if not path or #path == 0 then return end
-    local obj = { bucket_count = H_.settings.bucket_count, item_count = H_.settings.item_count, rewards = H_.settings.rewards }
-    local j = to_json_safe(obj)
-    local f = io.open(path, 'wb'); if not f then return end
-    f:write(j); f:close()
-end
-
----------------------------------------------------------------------------------------------------
--- Moon/Zone Helper Functions
----------------------------------------------------------------------------------------------------
 local function vana_timestamp()
     local ok, t = pcall(function()
-        local pVanaTime = ashita.memory.find('FFXiMain.dll', 0, 'B0015EC390518B4C24088D4424005068', 0, 0)
-        local pointer   = ashita.memory.read_uint32(pVanaTime + 0x34)
+        local pointer = AshitaCore:GetMemoryManager():GetTime()
         local rawTime   = ashita.memory.read_uint32(pointer + 0x0C) + 92514960
         local ts        = {}
         ts.day    = math.floor(rawTime / 3456)
